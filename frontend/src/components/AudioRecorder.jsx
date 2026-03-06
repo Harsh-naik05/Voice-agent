@@ -76,7 +76,7 @@ export default function AudioRecorder() {
 
   return (
     <div style={{ padding: 20 }}>
-      <h2>🎤 VoiceGate – Audio Recorder</h2>
+      <h2>🎤 Voiceagent - AI</h2>
 
       {!isRecording ? (
         <button onClick={startRecording}>🎙️ Start Recording</button>

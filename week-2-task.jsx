@@ -4,17 +4,17 @@
 
 
 import express from "express";
-import http from "http";
-import { Server } from "socket.io";
-import cors from "cors";
-import fs from "fs";
-import path from "path";
+import http from "http";                      //Creates HTTP server to attach Socket.IO 
+import { Server } from "socket.io";           //RL time commu. btw frnt and bcknd 
+import cors from "cors";            
+import fs from "fs";                          //File system access for temp WAV files
+import path from "path";                      //Path utilities for cross-platform file handling
 import { spawn } from "child_process";
 import dotenv from "dotenv";
 import { fileURLToPath } from "url";                       /*-----ES modules don’t support _dirname directly----*/
 import { GoogleGenerativeAI } from "@google/generative-ai"; /*---send STT text to the LLM---*/
 
-dotenv.config();
+dotenv.config();                                      //load .env
 
 /* ---------------- BASIC SETUP ---------------- */
 const __filename = fileURLToPath(import.meta.url);
@@ -174,7 +174,7 @@ server.listen(3000, () => {
 
 /* ---------------- WEEK 2: STREAM MIC → STT ---------------- */
   const startStreaming = async () => {                                /*-------Starts microphone capture-------*/
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });    /*Requests microphone access and gets audio stream for stt*/
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });  /*Requests microphone access and gets audio stream for stt*/
 
 
     streamRef.current = stream;                                     /*-------Store stream ref to stop later-------*/
