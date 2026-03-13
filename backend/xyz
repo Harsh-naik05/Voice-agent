@@ -14,17 +14,17 @@ dotenv.config();
 
 /* ---------------- MONGODB CONNECTION ---------------- */
 
-mongoose.connect(process.env.MONGO_URI)
+mongoose.connect(process.env.MONGO_URI);
 
 mongoose.connection.on("connected", () => {
   console.log("🟢 MongoDB connected");
 });
 
 mongoose.connection.on("error", (err) => {
-  console.error("❌MongoDB connection error:", err);
+  console.error("❌ MongoDB connection error:", err);
 });
 
-/* ---------------- CONVERSATION SCHEMA ---------------- */
+/* ---------------- SCHEMAS ---------------- */
 
 const conversationSchema = new mongoose.Schema({
   userText: String,
@@ -34,11 +34,22 @@ const conversationSchema = new mongoose.Schema({
 
 const Conversation = mongoose.model("Conversation", conversationSchema);
 
+const leadSchema = new mongoose.Schema({
+  name: String,
+  company: String,
+  service: String,
+  budget: String,
+  status: { type: String, default: "Qualified" },
+  createdAt: { type: Date, default: Date.now }
+});
+
+const Lead = mongoose.model("Lead", leadSchema);
+
 /* ---------------- BASIC SETUP ---------------- */
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const conversationFile = path.join(__dirname, "conversations.json");
 const PYTHON_PATH = path.join(__dirname, ".venv", "Scripts", "python.exe");
 console.log("🐍 Using Python:", PYTHON_PATH);
 
@@ -55,69 +66,50 @@ const io = new Server(server, {
 });
 
 /* ---------------- GEMINI SETUP ---------------- */
+
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 const model = genAI.getGenerativeModel({
   model: "gemini-2.5-flash",
 });
 
-/* ---------------- SAVE CONVERSATION ---------------- */
-function saveConversation(userText, aiResponse) {
-  const conversation = {
-    user_text: userText,
-    ai_response: aiResponse,
-    timestamp: new Date().toISOString(),
-  };
-
-  let data = [];
-
-  if (fs.existsSync(conversationFile)) {
-    const fileData = fs.readFileSync(conversationFile);
-    data = JSON.parse(fileData);
-  }
-
-  data.push(conversation);
-
-  fs.writeFileSync(conversationFile, JSON.stringify(data, null, 2));
-}
-
 /* ---------------- SOCKET ---------------- */
+
 io.on("connection", (socket) => {
+
   console.log("✅ Client connected:", socket.id);
 
   let audioChunks = [];
   socket.llmBusy = false;
+
+  socket.leadData = {
+    name: "",
+    company: "",
+    service: "",
+    budget: ""
+  };
 
   socket.on("audio_chunk", (arrayBuffer) => {
     audioChunks.push(Buffer.from(arrayBuffer));
   });
 
   socket.on("audio_end", () => {
+
     console.log("🎙️ Audio recording finished");
 
     const audioBuffer = Buffer.concat(audioChunks);
     audioChunks = [];
 
-    if (audioBuffer.length < 2000) {
-      socket.emit("error", "Audio too short");
-      return;
-    }
+    if (audioBuffer.length < 2000) return;
 
     const wavPath = path.join(
       __dirname,
       `recording-${socket.id}-${Date.now()}.wav`
     );
 
-    /* ---------- FFmpeg ---------- */
-    console.log("🎚️ Audio buffer size:", audioBuffer.length);
-    if (!audioBuffer || audioBuffer.length < 8000) {
-      console.warn("⚠️ Audio too short or empty, skipping");
-      return;
-    }
-
     const ffmpeg = spawn("ffmpeg", [
-      "-hide_banner",      // 1. Hides the huge version/config text
-      "-loglevel", "error", // 2. Hides progress bars and warnings
+      "-hide_banner",
+      "-loglevel", "error",
       "-y",
       "-i", "pipe:0",
       "-ar", "16000",
@@ -126,71 +118,105 @@ io.on("connection", (socket) => {
       wavPath,
     ]);
 
-
-    ffmpeg.stderr.on("data", (d) => {
-      console.error("FFmpeg error:", d.toString());
-    });
-
     ffmpeg.stdin.write(audioBuffer);
     ffmpeg.stdin.end();
-    
-    ffmpeg.on("close", async (code) => {
-      if (code !== 0) {
-        console.error("❌ FFmpeg failed");
-        return;
-      }
 
-      // ⏳ wait until file really exists (Windows-safe)
-      let attempts = 0;
-      while (!fs.existsSync(wavPath) && attempts < 10) {
-        await new Promise((r) => setTimeout(r, 100));
-        attempts++;
-      }
+    ffmpeg.on("close", async () => {
 
-      if (!fs.existsSync(wavPath)) {
-        console.error("❌ WAV file not found after FFmpeg:", wavPath);
-        return;
-      }
-
-      console.log("🎧 WAV ready:", wavPath);
-
-      /* ---------- STT ---------- */
       const stt = spawn(PYTHON_PATH, ["stt_stream.py", wavPath]);
 
       stt.stdout.on("data", async (data) => {
+
         const textChunk = data.toString().trim();
         if (!textChunk || textChunk === "STT started") return;
 
         console.log("📝 STT chunk:", textChunk);
         socket.emit("stt_chunk", textChunk);
 
+        /* -------- LEAD EXTRACTION -------- */
+
+        const lower = textChunk.toLowerCase();
+
+        if (lower.includes("name is")) {
+          socket.leadData.name = textChunk.split("is")[1]?.trim();
+        }
+
+        if (lower.includes("work at") || lower.includes("work for")) {
+          socket.leadData.company = textChunk.replace(/i work (at|for)/i, "").trim();
+        }
+
+        if (lower.includes("need") || lower.includes("looking for") || lower.includes("interested")) {
+          socket.leadData.service = textChunk;
+        }
+
+        if (lower.includes("budget") || lower.includes("$") || lower.includes("dollar")) {
+          socket.leadData.budget = textChunk;
+        }
+
         if (socket.llmBusy) return;
         socket.llmBusy = true;
 
         try {
-          const result = await model.generateContent(textChunk);
-          
-          let reply = result.response.text().slice(0,180);
 
-          if (reply.includes("."))
-            {
-              reply = reply.substring(0, reply.lastIndexOf(".") + 1);
-            }
-          
-          if (!reply.trim()) {
-            reply = "Hello! How can I help you?";
-          }
+          const lead = socket.leadData;
+
+          const prompt = `
+          You are VoiceGate AI, a friendly sales assistant.
+
+          Collect this information step by step:
+          1. Name
+          2. Company
+          3. Service
+          4. Budget
+
+          Collected so far:
+          Name: ${lead.name || "missing"}
+          Company: ${lead.company || "missing"}
+          Service: ${lead.service || "missing"}
+          Budget: ${lead.budget || "missing"}
+
+          If everything is collected, thank the user and say our team will contact them.
+
+          User message:
+          ${textChunk}
+
+          Reply in one short sentence.
+          `;
+
+          const result = await model.generateContent(prompt);
+
+          let reply = result.response.text().trim();
+          if (reply.length > 180) reply = reply.slice(0,180);
 
           console.log("🤖 Gemini:", reply);
+
           socket.emit("llm_response", reply);
-         
-          /* ⭐ SAVE TO MONGODB */
+
           await Conversation.create({
             userText: textChunk,
             aiResponse: reply
           });
-    
-          // 🔊 TTS PROCESS
+
+          /* -------- SAVE LEAD -------- */
+
+          if (lead.name && lead.company && lead.service && lead.budget) {
+
+            await Lead.create({
+              name: lead.name,
+              company: lead.company,
+              service: lead.service,
+              budget: lead.budget
+            });
+
+            console.log("✅ Lead saved:", lead);
+
+            socket.emit("llm_response","Thank you! Our sales team will contact you soon.");
+
+            // do NOT reset immediately or conversation restarts
+          }
+
+          /* -------- TTS -------- */
+
           const tts = spawn(PYTHON_PATH, ["tts.py", reply]);
 
           tts.stdout.on("data", (data) => {
@@ -205,38 +231,28 @@ io.on("connection", (socket) => {
             fs.unlinkSync(audioPath);
           });
 
-          tts.stderr.on("data", (d) => {
-            console.error("TTS error:", d.toString());
-          });
-
         } catch (err) {
-          // console.error("Gemini error:", err.message);
-          console.error("Gemini error FULL:", err);
-        } finally {
-          setTimeout(() => {
-            socket.llmBusy = false;
-          }, 300);// add a small delay before allowing next LLM response
+          console.error("Gemini error:", err.message);
         }
-      });
 
-      stt.stderr.on("data", (d) =>
-        console.error("STT error:", d.toString())
-      );
+        finally {
+          socket.llmBusy = false;
+        }
+
+      });
 
       stt.on("close", () => {
         if (fs.existsSync(wavPath)) fs.unlinkSync(wavPath);
       });
+
     });
+
   });
 
-  socket.on("disconnect", () => {
-    console.log("❌ Client disconnected:", socket.id);
-  });
 });
 
-/* ---------------- START ---------------- */
-const PORT = 3000;
-server.listen(PORT, () => {
-  console.log(`🚀 Server running on http://localhost:${PORT}`);
-});
+/* ---------------- START SERVER ---------------- */
 
+server.listen(3000, () => {
+  console.log("🚀 Server running on http://localhost:3000");
+});
