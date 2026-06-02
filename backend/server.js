@@ -7,40 +7,41 @@ import path from "path";
 import { spawn } from "child_process";
 import dotenv from "dotenv";
 import { fileURLToPath } from "url";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import Groq from "groq-sdk";
 import mongoose from "mongoose";
 
 dotenv.config();
 
-/* ---------------- MONGODB CONNECTION ---------------- */
+/* ---------------- GROQ ---------------- */
+const groq = new Groq({
+  apiKey: process.env.GROQ_API_KEY,
+});
 
-mongoose.connect(process.env.MONGO_URI)
+/* ---------------- MONGODB ---------------- */
+mongoose.connect(process.env.MONGO_URI);
 
 mongoose.connection.on("connected", () => {
   console.log("🟢 MongoDB connected");
 });
 
 mongoose.connection.on("error", (err) => {
-  console.error("❌MongoDB connection error:", err);
+  console.error("❌ MongoDB error:", err);
 });
 
-/* ---------------- CONVERSATION SCHEMA ---------------- */
+/* ---------------- SCHEMA ---------------- */
+const Conversation = mongoose.model(
+  "Conversation",
+  new mongoose.Schema({
+    userText: String,
+    aiResponse: String,
+    createdAt: { type: Date, default: Date.now },
+  })
+);
 
-const conversationSchema = new mongoose.Schema({
-  userText: String,
-  aiResponse: String,
-  createdAt: { type: Date, default: Date.now }
-});
-
-const Conversation = mongoose.model("Conversation", conversationSchema);
-
-/* ---------------- BASIC SETUP ---------------- */
+/* ---------------- BASIC ---------------- */
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
-const conversationFile = path.join(__dirname, "conversations.json");
 const PYTHON_PATH = path.join(__dirname, ".venv", "Scripts", "python.exe");
-console.log("🐍 Using Python:", PYTHON_PATH);
 
 const app = express();
 app.use(cors());
@@ -48,37 +49,27 @@ app.use(cors());
 const server = http.createServer(app);
 
 const io = new Server(server, {
-  cors: {
-    origin: "http://localhost:5173",
-    methods: ["GET", "POST"],
-  },
+  cors: { origin: "http://localhost:5173" },
 });
 
-/* ---------------- GEMINI SETUP ---------------- */
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+/* ---------------- LLM ---------------- */
+async function generateLLM(prompt) {
+  try {
+    const completion = await groq.chat.completions.create({
+      messages: [
+        { role: "system", content: "You are a helpful voice assistant." },
+        { role: "user", content: prompt },
+      ],
+      model: "llama-3.3-70b-versatile",
+      temperature: 0.7,
+      max_tokens: 250,
+    });
 
-const model = genAI.getGenerativeModel({
-  model: "gemini-2.5-flash",
-});
-
-/* ---------------- SAVE CONVERSATION ---------------- */
-function saveConversation(userText, aiResponse) {
-  const conversation = {
-    user_text: userText,
-    ai_response: aiResponse,
-    timestamp: new Date().toISOString(),
-  };
-
-  let data = [];
-
-  if (fs.existsSync(conversationFile)) {
-    const fileData = fs.readFileSync(conversationFile);
-    data = JSON.parse(fileData);
+    return completion.choices[0]?.message?.content || "No response";
+  } catch (err) {
+    console.error("❌ GROQ ERROR:", err.message);
+    return "Sorry, I could not respond right now.";
   }
-
-  data.push(conversation);
-
-  fs.writeFileSync(conversationFile, JSON.stringify(data, null, 2));
 }
 
 /* ---------------- SOCKET ---------------- */
@@ -86,20 +77,20 @@ io.on("connection", (socket) => {
   console.log("✅ Client connected:", socket.id);
 
   let audioChunks = [];
+  let fullText = "";
   socket.llmBusy = false;
+  socket.llmTimer = null;
 
-  socket.on("audio_chunk", (arrayBuffer) => {
-    audioChunks.push(Buffer.from(arrayBuffer));
+  socket.on("audio_chunk", (chunk) => {
+    audioChunks.push(Buffer.from(chunk));
   });
 
   socket.on("audio_end", () => {
-    console.log("🎙️ Audio recording finished");
-
     const audioBuffer = Buffer.concat(audioChunks);
     audioChunks = [];
 
-    if (audioBuffer.length < 2000) {
-      socket.emit("error", "Audio too short");
+    if (!audioBuffer || audioBuffer.length < 8000) {
+      console.log("⚠️ Audio too short");
       return;
     }
 
@@ -108,16 +99,7 @@ io.on("connection", (socket) => {
       `recording-${socket.id}-${Date.now()}.wav`
     );
 
-    /* ---------- FFmpeg ---------- */
-    console.log("🎚️ Audio buffer size:", audioBuffer.length);
-    if (!audioBuffer || audioBuffer.length < 8000) {
-      console.warn("⚠️ Audio too short or empty, skipping");
-      return;
-    }
-
     const ffmpeg = spawn("ffmpeg", [
-      "-hide_banner",      // 1. Hides the huge version/config text
-      "-loglevel", "error", // 2. Hides progress bars and warnings
       "-y",
       "-i", "pipe:0",
       "-ar", "16000",
@@ -126,117 +108,124 @@ io.on("connection", (socket) => {
       wavPath,
     ]);
 
-
-    ffmpeg.stderr.on("data", (d) => {
-      console.error("FFmpeg error:", d.toString());
+    ffmpeg.on("error", (err) => {
+      console.error("❌ FFmpeg error:", err);
     });
 
     ffmpeg.stdin.write(audioBuffer);
     ffmpeg.stdin.end();
-    
-    ffmpeg.on("close", async (code) => {
-      if (code !== 0) {
-        console.error("❌ FFmpeg failed");
-        return;
-      }
 
-      // ⏳ wait until file really exists (Windows-safe)
-      let attempts = 0;
-      while (!fs.existsSync(wavPath) && attempts < 10) {
-        await new Promise((r) => setTimeout(r, 100));
-        attempts++;
-      }
-
+    ffmpeg.on("close", async () => {
       if (!fs.existsSync(wavPath)) {
-        console.error("❌ WAV file not found after FFmpeg:", wavPath);
+        console.error("❌ WAV not created");
         return;
       }
 
-      console.log("🎧 WAV ready:", wavPath);
+      console.log("🎧 WAV ready");
 
-      /* ---------- STT ---------- */
       const stt = spawn(PYTHON_PATH, ["stt_stream.py", wavPath]);
 
-      stt.stdout.on("data", async (data) => {
+      stt.stdout.on("data", (data) => {
         const textChunk = data.toString().trim();
         if (!textChunk || textChunk === "STT started") return;
 
-        console.log("📝 STT chunk:", textChunk);
-        socket.emit("stt_chunk", textChunk);
+        console.log("📝 STT:", textChunk);
 
-        if (socket.llmBusy) return;
-        socket.llmBusy = true;
+        fullText += " " + textChunk;
 
-        try {
-          const result = await model.generateContent(textChunk);
-          
-          let reply = result.response.text().slice(0,180);
+        // Send complete sentence to frontend
+        socket.emit("stt_chunk", fullText.trim());
 
-          if (reply.includes("."))
-            {
-              reply = reply.substring(0, reply.lastIndexOf(".") + 1);
-            }
-          
-          if (!reply.trim()) {
-            reply = "Hello! How can I help you?";
+        clearTimeout(socket.llmTimer);
+
+        socket.llmTimer = setTimeout(async () => {
+          if (socket.llmBusy) return;
+
+          if (!fullText.trim() || fullText.length < 3) {
+            console.log("⚠️ Ignoring empty input");
+            return;
           }
 
-          console.log("🤖 Gemini:", reply);
-          socket.emit("llm_response", reply);
-         
-          /* ⭐ SAVE TO MONGODB */
-          await Conversation.create({
-            userText: textChunk,
-            aiResponse: reply
-          });
-    
-          // 🔊 TTS PROCESS
-          const tts = spawn(PYTHON_PATH, ["tts.py", reply]);
+          socket.llmBusy = true;
 
-          tts.stdout.on("data", (data) => {
+          try {
+            const replyText = await generateLLM(fullText);
 
-            const audioFile = data.toString().trim();
-            const audioPath = path.join(__dirname, audioFile);
+            //let reply = replyText.slice(0, 500);
+            let reply = replyText;
+            if (!reply.trim()) reply = "Hello! How can I help you?";
 
-            const audioBuffer = fs.readFileSync(audioPath);
+            console.log("🤖 AI:", reply);
 
-            socket.emit("tts_audio", audioBuffer);
+            socket.emit("llm_response", reply);
 
-            fs.unlinkSync(audioPath);
-          });
+            // ✅ Save to DB
+            await Conversation.create({
+              userText: fullText,
+              aiResponse: reply,
+            });
 
-          tts.stderr.on("data", (d) => {
-            console.error("TTS error:", d.toString());
-          });
+            // ✅ TTS
+            const tts = spawn(PYTHON_PATH, ["tts.py", reply]);
 
-        } catch (err) {
-          // console.error("Gemini error:", err.message);
-          console.error("Gemini error FULL:", err);
-        } finally {
-          setTimeout(() => {
+            tts.stdout.on("data", (data) => {
+              const audioFile = data.toString().trim();
+              const audioPath = path.join(__dirname, audioFile);
+
+              if (!fs.existsSync(audioPath)) return;
+
+              const audioBuffer = fs.readFileSync(audioPath);
+              socket.emit("tts_audio", audioBuffer);
+
+              fs.unlinkSync(audioPath);
+            });
+
+            tts.stderr.on("data", (d) => {
+              console.error("❌ TTS error:", d.toString());
+            });
+
+          } catch (err) {
+            console.error("❌ LLM ERROR:", err);
+          } finally {
+            fullText = "";
             socket.llmBusy = false;
-          }, 300);// add a small delay before allowing next LLM response
-        }
+          }
+        }, 2500);
       });
 
-      stt.stderr.on("data", (d) =>
-        console.error("STT error:", d.toString())
-      );
+      stt.stderr.on("data", (d) => {
+        console.error("❌ STT ERROR:", d.toString());
+      });
 
       stt.on("close", () => {
-        if (fs.existsSync(wavPath)) fs.unlinkSync(wavPath);
+        if (fs.existsSync(wavPath)) {
+          try {
+            fs.unlinkSync(wavPath);
+          } catch {}
+        }
       });
     });
   });
 
   socket.on("disconnect", () => {
     console.log("❌ Client disconnected:", socket.id);
+
+    if (socket.llmTimer) {
+      clearTimeout(socket.llmTimer);
+    }
   });
 });
 
 /* ---------------- START ---------------- */
-const PORT = 3000;
-server.listen(PORT, () => {
-  console.log(`🚀 Server running on http://localhost:${PORT}`);
+server.listen(3000, () => {
+  console.log("🚀 Server running on http://localhost:3000");
 });
 
+/* ---------------- GLOBAL ERROR HANDLER ---------------- */
+process.on("uncaughtException", (err) => {
+  console.error("🔥 Uncaught Error:", err);
+});
+
+process.on("unhandledRejection", (err) => {
+  console.error("🔥 Promise Error:", err);
+});
